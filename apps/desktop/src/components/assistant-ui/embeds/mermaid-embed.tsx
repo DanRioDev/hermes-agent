@@ -1,7 +1,9 @@
 'use client'
 
 import { useStore } from '@nanostores/react'
+import type Katex from 'katex'
 import { atom, onMount } from 'nanostores'
+import type { MathResolver } from 'pele'
 import { useEffect, useState } from 'react'
 
 import { Zoomable } from '@/components/ui/zoomable'
@@ -16,6 +18,7 @@ import type { RichFenceProps } from './types'
 // puts each diagram type in its own chunk, so a flowchart pulls in only the
 // flowchart parser and layout.
 const loadPele = createRetryableLoader(() => import('pele/lazy'))
+const loadKatex = createRetryableLoader(() => import('katex'))
 
 // Pele colors a diagram through `--pele-*` custom properties. The SVG is shown
 // as an <img>: its own document, with no scripts and no access to the app's
@@ -104,10 +107,37 @@ function withPalette(svg: string, vars: string): string {
   return vars ? svg.replace(/^<svg\b[^>]*?\sstyle="/, root => `${root}${vars};`) : svg
 }
 
+// Pele leaves typesetting $$TeX$$ labels to the host. KaTeX's MathML output
+// needs no stylesheet or webfonts, so it draws inside the isolated <img> SVG
+// and in the PNG copy alike (Chromium renders MathML natively), as mermaid's
+// did. It is measured in the page to size the label. TeX KaTeX can't parse
+// returns null, and Pele shows the source.
+function typesetMath(katex: typeof Katex): MathResolver {
+  return (tex, size) => {
+    let html: string
+
+    try {
+      html = katex.renderToString(tex, { output: 'mathml', throwOnError: true })
+    } catch {
+      return null
+    }
+
+    const probe = document.createElement('span')
+    probe.style.cssText = `position:absolute;visibility:hidden;white-space:nowrap;line-height:normal;font-size:${size}px`
+    probe.innerHTML = html
+    document.body.append(probe)
+    const { height, width } = probe.getBoundingClientRect()
+    probe.remove()
+
+    return { height: Math.ceil(height), html, width: Math.ceil(width) }
+  }
+}
+
 const renderCache = createMermaidRenderCache({
   maxEntries: 32,
   render: async (code, themeKey) => {
-    const pele = await loadPele()
+    // KaTeX loads only for diagrams with $$TeX$$ labels.
+    const [pele, katex] = await Promise.all([loadPele(), code.includes('$$') ? loadKatex() : null])
     const theme = JSON.parse(themeKey) as DiagramTheme
 
     // Links and images off: the diagram is display-only, as under mermaid's
@@ -116,7 +146,8 @@ const renderCache = createMermaidRenderCache({
       fontFamily: theme.font,
       fontFamilyMono: theme.fontMono,
       images: false,
-      links: false
+      links: false,
+      math: katex ? typesetMath(katex.default) : undefined
     })
 
     return withPalette(svg, theme.vars)
