@@ -4,6 +4,7 @@ import binascii
 import hashlib
 import json
 
+from hermes_state_common import _sql_session_last_active
 from hermes_state_local_migration import client_history_row, validate_legacy_row
 from hermes_state_mutation_binding import authorize_history
 from hermes_state_runtime import RuntimeStoreError
@@ -67,7 +68,13 @@ def _excluded_sources():
 def _picker_row(row, tip, sid):
     return {'id': row['id'], 'session_id': sid, 'resolved_id': sid, 'title': row.get('title') or '',
             'source': tip['source'], 'started_at': row.get('started_at'),
-            'message_count': row.get('message_count', 0), 'model': tip.get('model'), 'running': False}
+            'message_count': row.get('message_count', 0), 'model': tip.get('model'), 'running': False,
+            'activity_at': _activity(row)}
+
+
+def _activity(row):
+    """Newest activity of the row's conversation (the listing's chain-aware ``_last_active``)."""
+    return row.get('_effective_last_active') or row.get('last_active') or row.get('started_at')
 
 
 def _native_reader(authority, actor):
@@ -91,6 +98,34 @@ def legacy_readable(authority, actor, sid):
         if exc.reason not in {'not_found', 'permission_denied'}:
             raise
         return False
+
+
+def _lineage_facts(db, root, segment):
+    """*root*'s logical conversation, judged the way the listing may spend a row on it: the newest
+    activity over its whole lineage (compression segments included), whether any segment holds a
+    message, and whether an admission is still queued there. Read-only, one checkout."""
+    lineage = db._resume_lineage_ids(segment)
+    with db._read_ctx() as conn:
+        row = conn.execute(
+            f"SELECT MAX({_sql_session_last_active('s')}) AS activity, "
+            'MAX(EXISTS(SELECT 1 FROM messages m WHERE m.session_id=s.id)) AS has_messages '
+            'FROM sessions s WHERE s.id IN (SELECT value FROM json_each(?))',
+            (json.dumps(lineage),)).fetchone()
+        pending = conn.execute(
+            "SELECT 1 FROM session_admissions WHERE target_session_id=? "
+            "AND status IN ('queued', 'started', 'unknown') LIMIT 1", (root,)).fetchone()
+    return ((row['activity'] if row is not None else None) or 0), (
+        bool(row['has_messages']) if row is not None else False), pending is not None
+
+
+def _empty_flood(authority, db, root, segment):
+    """*root* is a row with nothing to show: its whole lineage holds no message, no admission is
+    queued there and no runtime holds it live. A cached ``message_count`` is no proof either way, so
+    only the store's own rows decide; anything it cannot prove empty is listed."""
+    if root in authority.sessions:
+        return False
+    _, has_messages, pending = _lineage_facts(db, root, segment)
+    return not has_messages and not pending
 
 
 def stored_picker_sessions(authority, actor, *, limit, include_hidden=False, workspace=None, picker=False,
@@ -139,12 +174,23 @@ def stored_picker_sessions(authority, actor, *, limit, include_hidden=False, wor
                 if len(sessions) == limit:
                     break
                 continue
+            if local and _empty_flood(authority, db, tip.get('chat_id') or row['id'], sid):
+                continue  # a row with no transcript, no queued work and no live owner never crowds the page
             closed = _closed_local_session(authority, actor, row, tip)
             if closed is not None:
                 if closed['id'] not in seen:
                     seen.add(closed['id'])
                     sessions.append(closed)
                     sources.append((closed['id'], sid, row))
+                if len(sessions) == limit:
+                    break
+                continue
+            listed_elsewhere = _listed_open_elsewhere(authority, actor, row, tip)
+            if listed_elsewhere is not None:
+                if listed_elsewhere['id'] not in seen:
+                    seen.add(listed_elsewhere['id'])
+                    sessions.append(listed_elsewhere)
+                    sources.append((listed_elsewhere['id'], sid, row))
                 if len(sessions) == limit:
                     break
                 continue
@@ -169,8 +215,11 @@ def _closed_local_session(authority, actor, row, tip):
     picker listed it as resumable. None for anything else, including a session another principal owns."""
     from gateway.session_contract import SessionRef
     from gateway.session_local_close import closed_and_unviewed
+    from gateway.session_history_mount import is_history_mount
     owner = tip.get('chat_id')
     live = authority.sessions.get(owner) if owner else None
+    if live is not None and is_history_mount(live):
+        return None  # a read-only mount is not a closed local writer
     if live is None:
         if not owner or not _stored_closed(authority, actor, owner):
             return None
@@ -184,7 +233,48 @@ def _closed_local_session(authority, actor, row, tip):
             return None
     return {'id': owner, 'session_id': owner, 'resolved_id': owner, 'title': tip.get('title') or row.get('title') or '',
             'source': tip['source'], 'started_at': row.get('started_at'),
-            'message_count': row.get('message_count', 0), 'model': tip.get('model'), 'running': False}
+            'message_count': row.get('message_count', 0), 'model': tip.get('model'), 'running': False,
+            'activity_at': _activity(row)}
+
+
+def _listed_open_elsewhere(authority, actor, row, tip):
+    """A canonical local conversation another runtime left persisted open: the picker lists it, marked
+    non-resumable, so the client reads it (``session.transcript``) instead of taking it over. A row
+    with a live handle belongs to the live feed; an ended one is ``_closed_local_session``'s."""
+    owner = tip.get('chat_id')
+    if not open_elsewhere(authority, actor, tip):
+        return None
+    return {'id': owner, 'session_id': owner, 'resolved_id': owner,
+            'title': tip.get('title') or row.get('title') or '', 'source': tip['source'],
+            'started_at': row.get('started_at'), 'message_count': row.get('message_count', 0),
+            'model': tip.get('model'), 'running': False, 'resumable': False, 'owner_runtime': 'other',
+            'activity_at': _activity(row)}
+
+
+def open_elsewhere(authority, actor, tip):
+    """Picker metadata for a persisted-open canonical conversation with no local writer."""
+    from gateway.session_history_mount import is_history_mount
+    owner = tip.get('chat_id')
+    live = authority.sessions.get(owner) if owner else None
+    if not owner or (live is not None and not is_history_mount(live)) or not _stored_open(authority, actor, owner):
+        return None
+    return {'resumable': False, 'owner_runtime': 'other'}
+
+
+def _stored_open(authority, actor, owner):
+    """*owner*'s stored receipt passes the checks a restore judges it by, and its row is still open:
+    another runtime may hold it, so only a read-only mount may show it (that mount builds no agent,
+    subscribes no viewer and writes no row: ``gateway/session_stored_reads.py``)."""
+    from gateway.session_local_recovery import restorable_receipt
+    if actor.profile_id != authority.profile_id or 'session:read' not in actor.capabilities:
+        return False
+    try:
+        receipt, entry = restorable_receipt(authority, owner)
+        row = authority.db.get_session(entry.session_id)
+    except (KeyError, TypeError, ValueError, AttributeError, RuntimeStoreError):
+        return False
+    return ((same_owner(receipt['principal_id'], actor.subject) or 'session:operator' in actor.capabilities)
+            and row is not None and row['ended_at'] is None)
 
 
 def _stored_closed(authority, actor, owner):
@@ -199,7 +289,7 @@ def _stored_closed(authority, actor, owner):
     try:
         receipt, entry = restorable_receipt(authority, owner)
         row = authority.db.get_session(entry.session_id)
-    except (KeyError, TypeError, ValueError, AttributeError):
+    except (KeyError, TypeError, ValueError, AttributeError, RuntimeStoreError):
         return False
     return ((same_owner(receipt['principal_id'], actor.subject) or 'session:operator' in actor.capabilities)
             and row is not None and row['ended_at'] is not None

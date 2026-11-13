@@ -35,6 +35,8 @@ async def owner(tmp_path, monkeypatch):
     for index in range(SESSION_COUNT):
         sid = f'sess-{index:03d}'
         store._db.create_session(sid, source='telegram')
+        # This batching fixture represents real history, not the empty flood.
+        store._db.append_message(sid, 'user', 'history')
         authority.sessions[sid] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id=sid), sid)
         sids.append(sid)
     connection = AuthorityConnection(authority, object(), {'user_id': 'viewer'})
@@ -103,8 +105,10 @@ async def test_a_closed_unviewed_local_session_still_leaves_the_live_feed(owner)
     for sid, target in ((closed, 'target-closed'), (open_, 'target-open')):
         owner.db.set_meta(POLICY_PREFIX + sid, json.dumps({'entry': {'session_id': target}}))
     owner.db.set_meta(POLICY_PREFIX + owner.sids[2], '{not json')
-    with owner.db._lock:  # newest, so session.list's 200-row window holds all three
-        owner.db._conn.execute('UPDATE sessions SET started_at = 9e9 WHERE id IN (?,?,?)', owner.sids[:3])
+    import time
+    with owner.db._lock:  # newest activity, so session.list's 200-row window holds all three
+        owner.db._conn.execute('UPDATE sessions SET last_activity_at = ? WHERE id IN (?,?,?)',
+                               (time.time() + 60, *owner.sids[:3]))
     for method in ('session.list', 'session.active_list'):
         ids = {row['id'] for row in await owner.listing(method)}
         assert closed not in ids and open_ in ids and owner.sids[2] in ids, method

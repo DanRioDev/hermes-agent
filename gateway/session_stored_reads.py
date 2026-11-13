@@ -71,6 +71,10 @@ def _readable_target(connection, ref, params):
     judged at its compression tip by the rule the stored feed lists it by and a resume adopts it by,
     and is never adopted."""
     authority = connection.authority
+    from gateway.session_history_mount import mount_stored_local_history
+    target = mount_stored_local_history(authority, connection.actor, ref.session_id)
+    if target is not None:
+        return target
     try:
         authorize(connection, ref, params, 'session:read')
     except RuntimeStoreError as exc:

@@ -5304,6 +5304,9 @@ export interface CanonicalSessionListRow {
   workspace?: string | null
   last_active_at?: number | null
   pinned?: boolean | null
+  activity_at?: number | null
+  owner_runtime?: 'other' | null
+  resumable?: boolean | null
 }
 export interface CanonicalControlParams {
   profile?: string | null

@@ -17,6 +17,7 @@ import json
 from dataclasses import dataclass
 
 from gateway.session_contract import SessionHandle, SessionRef
+from hermes_state_common import _sql_session_last_active
 from hermes_state_runtime import RuntimeStoreError
 
 # Sessions per worker-thread read; each batch is one await, so the loop serves other work between them.
@@ -47,6 +48,7 @@ def _store_facts(db, session_ids):
         rows = conn.execute(
             "SELECT s.id, s.source, s.title, s.started_at, s.ended_at, s.message_count, s.model, s.hidden, "
             "s.archived, s.runtime_revision, s.runtime_generation, "
+            f"{_sql_session_last_active('s')} AS last_active, "
             "(SELECT t.ended_at FROM state_meta m JOIN sessions t ON t.id = CASE WHEN json_valid(m.value) "
             "THEN json_extract(m.value, '$.entry.session_id') END WHERE m.key = ? || s.id) AS target_ended_at "
             "FROM sessions s WHERE s.id IN (SELECT value FROM json_each(?))", (POLICY_PREFIX, ids)).fetchall()
@@ -58,6 +60,36 @@ def _store_facts(db, session_ids):
     for row in pending:
         by_session.setdefault(row['target_session_id'], []).append(dict(row))
     return {row['id']: dict(row) for row in rows}, by_session
+
+
+def lineage_has_messages(db, session_ids):
+    """Prove emptiness from message rows, never cached counts; uncertainty keeps the row."""
+    import sqlite3
+    session_ids = list(session_ids)
+    try:
+        with db._read_ctx() as conn:
+            present = {row[0] for row in conn.execute(
+                'SELECT DISTINCT session_id FROM messages WHERE session_id IN '
+                '(SELECT value FROM json_each(?))', (json.dumps(session_ids),))}
+    except (sqlite3.Error, TypeError, ValueError, AttributeError):
+        return set(session_ids)
+    for sid in session_ids:
+        if sid in present:
+            continue
+        try:
+            lineage = db._resume_lineage_ids(sid)
+            if not lineage:
+                present.add(sid)
+                continue
+            with db._read_ctx() as conn:
+                row = conn.execute(
+                    'SELECT EXISTS(SELECT 1 FROM messages WHERE session_id IN '
+                    '(SELECT value FROM json_each(?)))', (json.dumps(lineage),)).fetchone()
+            if row is None or row[0]:
+                present.add(sid)
+        except (sqlite3.Error, KeyError, TypeError, ValueError, AttributeError, RuntimeStoreError):
+            present.add(sid)
+    return present
 
 
 def _masked_pending(live, rows):

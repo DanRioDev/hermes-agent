@@ -47,6 +47,30 @@ def mount_history(authority, actor, sid):
     return True
 
 
+def mount_stored_local_history(authority, actor, sid):
+    """Read a persisted-open canonical conversation without restoring its writer."""
+    from gateway.session_authority import LiveSession
+    from gateway.session_local_recovery import restorable_receipt
+    from gateway.owner_identity import same_owner
+    live = authority.sessions.get(sid)
+    if live is not None and not is_history_mount(live):
+        return None
+    if actor.profile_id != authority.profile_id or 'session:read' not in actor.capabilities:
+        return None
+    try:
+        receipt, entry = restorable_receipt(authority, sid)
+        row = authority.db.get_session(entry.session_id)
+        allowed = same_owner(receipt['principal_id'], actor.subject) or 'session:operator' in actor.capabilities
+    except (KeyError, TypeError, ValueError, AttributeError, RuntimeStoreError):
+        return None
+    if row is None or row['ended_at'] is not None or not allowed:
+        return None
+    if live is None:
+        authority._require_admission_open()
+        authority.sessions[sid] = LiveSession(None, _ROUTE_PREFIX + sid)
+    return entry.session_id
+
+
 def is_history_mount(live):
     return live.source is None and live.route.startswith(_ROUTE_PREFIX)
 

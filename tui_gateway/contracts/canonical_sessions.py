@@ -217,6 +217,12 @@ class CanonicalSessionListRow(Result):
     workspace: str | None = None
     last_active_at: float | None = None
     pinned: bool | None = None
+    # Newest activity of the whole conversation (compression chain included): the picker's order.
+    activity_at: float | None = None
+    # A conversation another runtime left persisted open: listed so its history can be read, opening
+    # it with ``session.transcript`` (a read-only mount), never ``session.resume``.
+    owner_runtime: Literal['other'] | None = None
+    resumable: bool | None = None
 
 
 class CanonicalListResult(Result):

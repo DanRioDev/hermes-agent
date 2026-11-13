@@ -601,7 +601,9 @@ class AuthorityConnection:
             # Deliberately archived rows are skipped inside get_session_by_title /
             # resolve_session_by_title (#139779); recoverable auto-archives still resolve.
             from gateway.session_local_title import resolve_titled_session
-            found = resolve_titled_session(self.authority, self.actor, params['title'], missing_ok=True)
+            from gateway.session_listing import open_elsewhere
+            found = resolve_titled_session(self.authority, self.actor, params['title'], missing_ok=True,
+                                           read_only=True)
             if found is None:
                 return {'sessions': [], 'scope': 'stored'}
             row = self.authority.db.get_session(found.session_id) or {}
@@ -611,13 +613,24 @@ class AuthorityConnection:
                                   'resolved_id': found.session_id, 'title': row.get('title') or '',
                                   'root_title': root.get('title') or '', 'source': row.get('source'),
                                   'started_at': row.get('started_at'),
+                                  'activity_at': row.get('last_active') or row.get('started_at'),
+                                  **(open_elsewhere(self.authority, self.actor, row) or {}),
                                   'message_count': row.get('message_count', 0),
                                   'running': found.session_id in self.authority.sessions}],
                     'scope': 'stored'}
         from hermes_state_sessions import INTERNAL_LISTING_SOURCES
-        from gateway.session_live_listing import live_entries
+        from gateway.session_live_listing import live_entries, lineage_has_messages
+        from gateway.session_history_mount import is_history_mount
+        entries = await live_entries(self.authority, self.actor)
+        has_messages = await asyncio.to_thread(lineage_has_messages, self.authority.db,
+                                               [entry.session_id for entry in entries])
         sessions = []
-        for entry in await live_entries(self.authority, self.actor):
+        for entry in entries:
+            if is_history_mount(entry.live):
+                continue
+            if (entry.handle.execution_state == 'idle' and not entry.pending
+                    and not entry.live.subscribers and entry.session_id not in has_messages):
+                continue
             row = entry.row
             # The human picker feed (TUI switcher): kanban workers, `--source tool` integrations and
             # finite one-shot runs are not conversations, as on every other picker. Closed by its last
@@ -628,8 +641,10 @@ class AuthorityConnection:
             sessions.append({'session_id': entry.session_id, 'id': entry.session_id, 'title': row.get('title') or '',
                              'source': row.get('source'), 'started_at': row.get('started_at'),
                              'message_count': row.get('message_count', 0), 'model': row.get('model'),
+                             'activity_at': row.get('last_active') or row.get('started_at'),
                              'running': entry.handle.execution_state == 'running'})
-        sessions.sort(key=lambda row: row['started_at'] or 0, reverse=True)
+        # Recent activity, not start order: a resumed old conversation belongs at the top.
+        sessions.sort(key=lambda row: row['activity_at'] or 0, reverse=True)
         from gateway.session_picker_fields import live_picker_page
         return {'sessions': await asyncio.to_thread(live_picker_page, self.authority, sessions, limit, workspace, picker),
                 'scope': 'live'}

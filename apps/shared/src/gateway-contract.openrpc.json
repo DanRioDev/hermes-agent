@@ -10863,6 +10863,43 @@
             ],
             "default": null,
             "title": "Pinned"
+          },
+          "activity_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Activity At"
+          },
+          "owner_runtime": {
+            "anyOf": [
+              {
+                "const": "other",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Owner Runtime"
+          },
+          "resumable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resumable"
           }
         },
         "required": [

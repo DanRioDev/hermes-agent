@@ -9,7 +9,7 @@ from __future__ import annotations
 from hermes_state_runtime import RuntimeStoreError
 
 
-def resolve_titled_session(authority, actor, name, *, missing_ok=False):
+def resolve_titled_session(authority, actor, name, *, missing_ok=False, read_only=False):
     """Exact session id first, then title (latest ``"<title> #N"`` continuation wins over
     the bare title), projected forward to the compression tip. Only a local session the
     actor may read is returned, or one a messaging lane took over from a local surface
@@ -34,6 +34,19 @@ def resolve_titled_session(authority, actor, name, *, missing_ok=False):
         if moved is not None:
             authority.authorize(actor, moved, 'session:read')
             return moved
+        if read_only:
+            from gateway.session_contract import SessionRef
+            from gateway.session_listing import open_elsewhere, legacy_readable
+            if open_elsewhere(authority, actor, tip):
+                return SessionRef(authority.profile_id, tip['chat_id'])
+            local_id = tip.get('chat_id') or tip['id']
+            if local_id in authority.sessions:
+                ref = SessionRef(authority.profile_id, local_id)
+                authority.authorize(actor, ref, 'session:read')
+                return ref
+            if legacy_readable(authority, actor, tip['id']):
+                return SessionRef(authority.profile_id, tip['id'])
+            raise RuntimeStoreError('not_found')
         from gateway.session_local_migration import resolve_local_target
         ref = resolve_local_target(authority, actor, tip['id'])
     except RuntimeStoreError as exc:
